@@ -16,6 +16,12 @@ on:
 permissions:
   issues: write
 
+# One dispatch per ticket at a time. A second run for the same issue waits here, then
+# sees the ticket was already dispatched and skips, so a ticket never gets two workers.
+concurrency:
+  group: swf-dispatch-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   dispatch:
     if: github.event.label.name == 'swf:ready' && github.actor == github.repository_owner
@@ -29,6 +35,15 @@ jobs:
       - name: Find target project
         id: target
         run: |
+          # Skip tickets that are already closed or already dispatched.
+          state=$(gh api "repos/$SWF_REPO/issues/$ISSUE" --jq .state)
+          dispatched=$(gh api "repos/$SWF_REPO/issues/$ISSUE/comments" --paginate --jq '.[] | select(.body | startswith("Dispatched → ")) | .id' | wc -l)
+          if [ "$state" != "open" ] || [ "$dispatched" -gt 0 ]; then
+            echo "Ticket #$ISSUE is $state and was dispatched $dispatched time(s): skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           projects=$(gh api "repos/$SWF_REPO/issues/$ISSUE/labels" --jq '[.[].name | select(startswith("project:")) | sub("^project:"; "")] | join(" ")')
           count=$(wc -w <<<"$projects")
           if [ "$count" -ne 1 ]; then
@@ -40,6 +55,7 @@ jobs:
 
       - name: Create issue in project and start the factory
         id: create
+        if: steps.target.outputs.skip != 'true'
         env:
           DISPATCH_TOKEN: ${{ secrets.SWF_DISPATCH_TOKEN }}
           TARGET: ${{ steps.target.outputs.repo }}
@@ -56,6 +72,7 @@ jobs:
           echo "ref=$TARGET#$num" >> "$GITHUB_OUTPUT"
 
       - name: Link and close the swf ticket
+        if: steps.target.outputs.skip != 'true'
         env:
           URL: ${{ steps.create.outputs.url }}
           REF: ${{ steps.create.outputs.ref }}
