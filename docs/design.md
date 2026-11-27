@@ -39,12 +39,23 @@ swf:backlog → swf:ready → swf:in-progress → swf:in-review → merged
 | `swf:in-progress` | Worker | Being built |
 | `swf:needs-info` | Worker | Questions posted on the issue. I answer, then set it back to `swf:ready` |
 | `swf:in-review` | Worker | PR opened, reviewer has commented |
+| `swf:failed` | Worker | Couldn't finish (tests failing, crash). Reason on the issue. Re-add `swf:ready` to retry |
 
 ## Worker rules
 
 - Work on a branch `swf/<issue-number>-<slug>` and open a PR that says `Closes #<n>`.
 - **Always run the test suite before pushing.** If tests fail, don't open the PR: comment on the issue with the failure.
 - If the ticket is ambiguous, comment questions on the issue, set `swf:needs-info`, and stop.
+
+## Implementation
+
+- [`factory.yml`](../.github/workflows/factory.yml) is the reusable workflow with two jobs: `worker`, then `reviewer`.
+- Each project has `.github/workflows/swf.yml`, which fires on `issues: labeled` with `swf:ready` and passes the test command.
+- The worker and reviewer run `anthropics/claude-code-action@v1` with the Claude GitHub App. PRs come from `claude[bot]`, so the project's own CI runs on them.
+- **Tests before push are enforced**, not just requested: a git `pre-push` hook runs the test command, and `--no-verify` and force pushes are denied.
+- The worker ends with structured output (`pr_opened` / `needs_info` / `failed`). A plain workflow step uses it to set labels, so a crash still ends as `swf:failed` with a link to the logs.
+- The reviewer posts one comment-only review: a verdict, then findings with `path:line` and suggested changes. It can't edit, push, approve or merge.
+- Turn caps (80 for the worker, 30 for the reviewer) and job timeouts limit usage of the Pro plan per ticket.
 
 ## Projects
 
@@ -60,3 +71,4 @@ Adding a project means adding one caller workflow, one secret and the `swf:*` la
 
 - Usage volume is unknown. Measure it after the first tickets, and see whether Pro limits are enough.
 - Test commands above are a first guess. Confirm them for each repo.
+- `masbench` fails `go test ./...` on `main` today (`go vet` flags `cmd/run.go:118`). That's the first ticket.
