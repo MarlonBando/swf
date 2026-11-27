@@ -1,0 +1,73 @@
+# swf dispatcher: forwards a ready ticket from swf to its project repo.
+#
+# A ticket is an issue in swf with one `project:<repo>` label. When it gets `swf:ready`,
+# this workflow creates the same issue in MarlonBando/<repo>, labels it `swf:ready`
+# (which starts that repo's factory run), links the two, and closes the swf issue.
+#
+# Needs secret SWF_DISPATCH_TOKEN: fine-grained token with Issues read/write on the projects.
+# The default GITHUB_TOKEN can't write to other repos, and its labels wouldn't trigger workflows.
+
+name: swf dispatch
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+
+jobs:
+  dispatch:
+    if: github.event.label.name == 'swf:ready' && github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SWF_REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Find target project
+        id: target
+        run: |
+          projects=$(gh api "repos/$SWF_REPO/issues/$ISSUE/labels" --jq '[.[].name | select(startswith("project:")) | sub("^project:"; "")] | join(" ")')
+          count=$(wc -w <<<"$projects")
+          if [ "$count" -ne 1 ]; then
+            gh issue comment "$ISSUE" -R "$SWF_REPO" --body "swf dispatch: this ticket needs exactly one \`project:<repo>\` label (found: ${projects:-none}). Fix the labels, then add \`swf:ready\` again."
+            gh issue edit "$ISSUE" -R "$SWF_REPO" --remove-label swf:ready
+            exit 1
+          fi
+          echo "repo=$OWNER/$projects" >> "$GITHUB_OUTPUT"
+
+      - name: Create issue in project and start the factory
+        id: create
+        env:
+          DISPATCH_TOKEN: ${{ secrets.SWF_DISPATCH_TOKEN }}
+          TARGET: ${{ steps.target.outputs.repo }}
+        run: |
+          gh api "repos/$SWF_REPO/issues/$ISSUE" > src.json
+          jq -r .title src.json > title.txt
+          { jq -r '.body // ""' src.json; printf '\n\n---\nDispatched from %s#%s by swf.\n' "$SWF_REPO" "$ISSUE"; } > body.md
+
+          url=$(GH_TOKEN="$DISPATCH_TOKEN" gh issue create -R "$TARGET" --title "$(cat title.txt)" --body-file body.md)
+          num=${url##*/}
+          # Label in a separate call so the project's `issues: labeled` workflow fires reliably.
+          GH_TOKEN="$DISPATCH_TOKEN" gh issue edit "$num" -R "$TARGET" --add-label swf:ready
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "ref=$TARGET#$num" >> "$GITHUB_OUTPUT"
+
+      - name: Link and close the swf ticket
+        env:
+          URL: ${{ steps.create.outputs.url }}
+          REF: ${{ steps.create.outputs.ref }}
+        run: |
+          gh issue comment "$ISSUE" -R "$SWF_REPO" --body "Dispatched → $REF ($URL). The factory is working on it there."
+          gh issue edit "$ISSUE" -R "$SWF_REPO" --remove-label swf:backlog 2>/dev/null || true
+          gh issue close "$ISSUE" -R "$SWF_REPO" --reason completed
+
+      - name: Report failure on the swf ticket
+        if: failure() && steps.target.outcome == 'success'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue comment "$ISSUE" -R "$SWF_REPO" --body "swf dispatch failed. Logs: $RUN_URL. Check that SWF_DISPATCH_TOKEN can write issues in the target repo, then add \`swf:ready\` again."
+          gh issue edit "$ISSUE" -R "$SWF_REPO" --remove-label swf:ready || true

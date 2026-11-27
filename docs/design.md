@@ -4,10 +4,15 @@ How the factory works in practice. Decisions made so far, and what's still open.
 
 ## Pipeline
 
-1. **Intake.** I brainstorm with Claude in chat (phone, PC or Claude Code). Claude creates the issue in the target repo.
-2. **Worker.** When I say the ticket is ready, Claude adds the `swf:ready` label. That label is the only trigger. Creating an issue never starts work.
-3. **Reviewer.** Runs right after the worker, with fresh context. It comments and suggests changes on the PR. It never pushes.
-4. **Me.** I check the PR and merge. The PR closes the issue.
+1. **Intake.** I open a Claude Code session on the `swf` repo: the Code tab on my phone, or the CLI on my PC. With `/swf-ticket`, Claude brainstorms with me and files the ticket as an issue **in swf**, labeled `project:<repo>` and `swf:backlog`.
+2. **Dispatch.** When I say the ticket is ready, Claude adds `swf:ready` to the swf issue. [`dispatch.yml`](../.github/workflows/dispatch.yml) creates the issue in the project repo with `swf:ready`, links the two, and closes the swf issue. The `swf:ready` label is the only trigger: creating an issue never starts work.
+3. **Worker.** The project's `swf.yml` fires on `swf:ready` and runs the worker.
+4. **Reviewer.** Runs right after the worker, with fresh context. It comments and suggests changes on the PR. It never pushes.
+5. **Me.** I check the PR and merge. The PR closes the issue.
+
+### Why tickets start in swf
+
+A cloud session can only reach the repo it was started on. So I always start the session on `swf`, and the dispatcher, using the `SWF_DISPATCH_TOKEN` secret (a fine-grained token with Issues read/write on the project repos), carries the ticket over. swf issues are the intake log. Work and status live in the project repo.
 
 ## Where it runs
 
@@ -65,7 +70,7 @@ swf:backlog → swf:ready → swf:in-progress → swf:in-review → merged
 | [finalboss](https://github.com/MarlonBando/finalboss) | private | Go | `go test ./...` |
 | [nextup](https://github.com/MarlonBando/nextup) | private | Go backend + static frontend | `cd backend && go test ./...` |
 
-Adding a project means adding one caller workflow, one secret and the `swf:*` labels.
+Adding a project means: one caller workflow, the `CLAUDE_CODE_OAUTH_TOKEN` secret and the `swf:*` labels in the project, plus a `project:<repo>` label in swf and the repo added to `SWF_DISPATCH_TOKEN`.
 
 ## Open
 
