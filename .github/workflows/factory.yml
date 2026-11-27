@@ -1,8 +1,14 @@
 # swf factory: reusable workflow called from each project repo.
 #
 # Trigger lives in the caller (issue labeled `swf:ready`). This workflow:
-#   1. worker:   reads the issue, asks questions or implements it, runs tests, opens a PR
-#   2. reviewer: reviews that PR against the issue and leaves comments (never pushes)
+#   1. worker:   builds the ticket and opens a PR, or, if the ticket already has an open swf PR,
+#                addresses its latest review (fix mode)
+#   2. reviewer: reviews the PR with fresh context and gives a verdict (never pushes)
+#   3. fix:      only after a fresh build that got "needs changes": one automatic fix round
+#   4. review-2: reviews the fix. Still "needs changes" stops at swf:changes-requested for the owner
+#
+# A manual `swf:ready` on a ticket with an open PR runs steps 1 and 2 in fix mode, with no
+# automatic round after it.
 
 name: swf factory
 
@@ -41,159 +47,71 @@ concurrency:
 
 jobs:
   worker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
     permissions:
       contents: write
       issues: write
       pull-requests: write
       id-token: write
-    outputs:
-      pr_number: ${{ steps.finalize.outputs.pr_number }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      ISSUE: ${{ inputs.issue_number }}
-    steps:
-      - name: Mark issue in progress
-        run: |
-          gh issue edit "$ISSUE" -R "$REPO" --add-label swf:in-progress
-          for l in swf:ready swf:needs-info swf:failed swf:backlog; do
-            gh issue edit "$ISSUE" -R "$REPO" --remove-label "$l" 2>/dev/null || true
-          done
-
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        if: inputs.go_version_file != ''
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: ${{ inputs.go_version_file }}
-
-      - name: Install pre-push hook (tests must pass before any push)
-        env:
-          TEST_COMMAND: ${{ inputs.test_command }}
-        run: |
-          {
-            echo '#!/usr/bin/env bash'
-            echo 'set -euo pipefail'
-            echo 'cd "$(git rev-parse --show-toplevel)"'
-            echo 'echo "swf pre-push: running test suite"'
-            printf '%s\n' "$TEST_COMMAND"
-          } > .git/hooks/pre-push
-          chmod +x .git/hooks/pre-push
-          cat .git/hooks/pre-push
-
-      - name: Worker
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            You are the worker of swf, a personal software factory.
-            REPO: ${{ github.repository }}
-            ISSUE NUMBER: ${{ inputs.issue_number }}
-            DEFAULT BRANCH: ${{ github.event.repository.default_branch }}
-            TEST COMMAND: ${{ inputs.test_command }}
-
-            1. Read the issue and every comment: `gh issue view ${{ inputs.issue_number }} --comments`.
-               Tickets have a Goal, Acceptance criteria and Out of scope. Later comments may answer
-               earlier questions. Read the repo's README and CLAUDE.md if present.
-
-            2. If the ticket is ambiguous or you need a decision only the owner can make, do NOT
-               write code. Post your questions as one numbered list with
-               `gh issue comment ${{ inputs.issue_number }} --body "..."`, then finish with
-               status "needs_info".
-
-            3. Otherwise create a branch: `git checkout -b swf/${{ inputs.issue_number }}-<short-kebab-slug>`.
-               Implement exactly what the ticket asks. Respect Out of scope. Match the existing style.
-               Add or update tests for the behavior you change.
-
-            4. Run the full test suite with the TEST COMMAND and fix until it passes.
-               A pre-push hook also runs it and blocks the push if it fails. Never bypass the hook.
-
-            5. Commit with clear messages, then `git push -u origin HEAD`.
-
-            6. Open the PR against the default branch with `gh pr create`. The body must have:
-               a short summary, how each acceptance criterion is met, how you tested it,
-               and the line `Closes #${{ inputs.issue_number }}`. Finish with status "pr_opened"
-               and the PR number.
-
-            If you cannot get the tests to pass or cannot finish, do not open a PR. Comment on the
-            issue with what you tried and what failed, then finish with status "failed".
-          claude_args: |
-            --max-turns ${{ inputs.worker_max_turns }}
-            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh pr create:*),Bash(gh pr view:*),${{ inputs.extra_allowed_tools }}"
-            --disallowedTools "Bash(git push --no-verify:*),Bash(git push --force:*),Bash(git push -f:*),Bash(git -c:*)"
-            --json-schema '{"type":"object","properties":{"status":{"type":"string","enum":["pr_opened","needs_info","failed"]},"pr_number":{"type":"integer"},"summary":{"type":"string"}},"required":["status","summary"]}'
-
-      - name: Update labels
-        id: finalize
-        if: always()
-        env:
-          OUT: ${{ steps.claude.outputs.structured_output }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          OUT=${OUT:-'{}'}
-          status=$(printf '%s' "$OUT" | jq -r '.status // "crashed"' 2>/dev/null || echo crashed)
-          pr=$(printf '%s' "$OUT" | jq -r '.pr_number // empty' 2>/dev/null || true)
-          echo "status=$status pr=$pr"
-          gh issue edit "$ISSUE" -R "$REPO" --remove-label swf:in-progress || true
-          case "$status" in
-            pr_opened)  gh issue edit "$ISSUE" -R "$REPO" --add-label swf:in-review
-                        echo "pr_number=$pr" >> "$GITHUB_OUTPUT" ;;
-            needs_info) gh issue edit "$ISSUE" -R "$REPO" --add-label swf:needs-info ;;
-            failed)     gh issue edit "$ISSUE" -R "$REPO" --add-label swf:failed ;;
-            *)          gh issue edit "$ISSUE" -R "$REPO" --add-label swf:failed
-                        gh issue comment "$ISSUE" -R "$REPO" --body "swf worker stopped before finishing. Logs: $RUN_URL" ;;
-          esac
+    uses: MarlonBando/swf/.github/workflows/worker.yml@main
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      mode: auto
+      test_command: ${{ inputs.test_command }}
+      go_version_file: ${{ inputs.go_version_file }}
+      extra_allowed_tools: ${{ inputs.extra_allowed_tools }}
+      max_turns: ${{ inputs.worker_max_turns }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
   reviewer:
     needs: worker
     if: needs.worker.outputs.pr_number != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
     permissions:
       contents: read
-      issues: read
+      issues: write
       pull-requests: write
       id-token: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: refs/pull/${{ needs.worker.outputs.pr_number }}/head
-          fetch-depth: 0
+    uses: MarlonBando/swf/.github/workflows/reviewer.yml@main
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      pr_number: ${{ fromJSON(needs.worker.outputs.pr_number) }}
+      fix_follows: ${{ needs.worker.outputs.mode == 'build' }}
+      max_turns: ${{ inputs.reviewer_max_turns }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-      - name: Reviewer
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            You are the reviewer of swf, a personal software factory. Another agent wrote this PR.
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ needs.worker.outputs.pr_number }}
-            ISSUE NUMBER: ${{ inputs.issue_number }}
+  fix:
+    needs: [worker, reviewer]
+    if: needs.worker.outputs.mode == 'build' && needs.reviewer.outputs.verdict == 'needs_changes'
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    uses: MarlonBando/swf/.github/workflows/worker.yml@main
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      mode: fix
+      test_command: ${{ inputs.test_command }}
+      go_version_file: ${{ inputs.go_version_file }}
+      extra_allowed_tools: ${{ inputs.extra_allowed_tools }}
+      max_turns: ${{ inputs.worker_max_turns }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-            The PR branch is checked out in the working directory.
-            Read the ticket (`gh issue view ${{ inputs.issue_number }} --comments`), the PR
-            (`gh pr view ${{ needs.worker.outputs.pr_number }}`) and the diff
-            (`gh pr diff ${{ needs.worker.outputs.pr_number }}`). Open files for context as needed.
-
-            Check:
-            - Every acceptance criterion is met, and nothing out of scope was touched.
-            - Bugs, edge cases, error handling.
-            - Tests actually cover the change.
-            - Readability and consistency with the codebase.
-
-            Post exactly one review with
-            `gh pr review ${{ needs.worker.outputs.pr_number }} --comment --body "..."`.
-            Start with a one-line verdict (looks good to merge / needs changes). Then list findings,
-            most important first, each with `path:line` and a concrete suggested change.
-            If there is nothing worth changing, say so briefly. You only comment: never edit
-            files, push, approve or request changes formally.
-          claude_args: |
-            --max-turns ${{ inputs.reviewer_max_turns }}
-            --allowedTools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr review:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*)"
-            --disallowedTools "Edit,Write,Bash(git push:*),Bash(git commit:*),Bash(gh pr review --approve:*),Bash(gh pr review -a:*),Bash(gh pr merge:*)"
+  review-2:
+    needs: fix
+    if: needs.fix.outputs.pr_number != ''
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      id-token: write
+    uses: MarlonBando/swf/.github/workflows/reviewer.yml@main
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      pr_number: ${{ fromJSON(needs.fix.outputs.pr_number) }}
+      fix_follows: false
+      max_turns: ${{ inputs.reviewer_max_turns }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
