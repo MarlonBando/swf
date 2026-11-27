@@ -69,6 +69,7 @@ swf:backlog → swf:ready → swf:in-progress → swf:in-review → merged
 | [masbench](https://github.com/MarlonBando/masbench) | public | Go | `go test ./...` |
 | [finalboss](https://github.com/MarlonBando/finalboss) | private | Go | `go test ./...` |
 | [nextup](https://github.com/MarlonBando/nextup) | private | Go backend + static frontend | `cd backend && go test ./...` |
+| [foosball-dtu](https://github.com/MarlonBando/foosball-dtu) | public | Go backend + React frontend | `cd backend && go test ./...` |
 
 Adding a project means: one caller workflow, the `CLAUDE_CODE_OAUTH_TOKEN` secret and the `swf:*` labels in the project, plus a `project:<repo>` label in swf and the repo added to `SWF_DISPATCH_TOKEN`.
 
