@@ -1,0 +1,122 @@
+# swf reviewer: called by factory.yml, never directly by a project.
+#
+# Reviews the ticket's PR with fresh context, posts one comment-only review and returns a verdict:
+#   merge:         the ticket gets swf:in-review (ready for the owner)
+#   needs_changes: the ticket gets swf:changes-requested
+# When fix_follows is false and the verdict is needs_changes, it also tells the owner on the issue
+# that the automatic fix round is used up.
+
+name: swf reviewer
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        type: number
+        required: true
+      pr_number:
+        type: number
+        required: true
+      fix_follows:
+        description: True if factory.yml will run an automatic fix round after a needs_changes verdict
+        type: boolean
+        default: false
+      max_turns:
+        type: number
+        default: 30
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+    outputs:
+      verdict:
+        description: merge, needs_changes, or empty if the reviewer crashed
+        value: ${{ jobs.reviewer.outputs.verdict }}
+
+jobs:
+  reviewer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      id-token: write
+    outputs:
+      verdict: ${{ steps.labels.outputs.verdict }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ISSUE: ${{ inputs.issue_number }}
+      PR: ${{ inputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+
+      - name: Reviewer
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are the reviewer of swf, a personal software factory. Another agent wrote this PR.
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ inputs.pr_number }}
+            ISSUE NUMBER: ${{ inputs.issue_number }}
+
+            The PR branch is checked out in the working directory.
+            Read the ticket (`gh issue view ${{ inputs.issue_number }} --comments`), the PR with its
+            earlier reviews and comments (`gh pr view ${{ inputs.pr_number }} --comments`) and the diff
+            (`gh pr diff ${{ inputs.pr_number }}`). Open files for context as needed.
+            If there are earlier reviews, check whether their findings were addressed, and accept
+            the worker's reasons for skipping one when they are sound.
+
+            Check:
+            - Every acceptance criterion is met, and nothing out of scope was touched.
+            - Bugs, edge cases, error handling.
+            - Tests actually cover the change.
+            - Readability and consistency with the codebase.
+
+            Post exactly one review with
+            `gh pr review ${{ inputs.pr_number }} --comment --body "..."`.
+            Start with a one-line verdict (looks good to merge / needs changes). Then list findings,
+            most important first, each with `path:line` and a concrete suggested change.
+            If there is nothing worth changing, say so briefly. You only comment: never edit
+            files, push, approve or request changes formally.
+
+            Finish with verdict "needs_changes" only for problems worth another round of work:
+            a missed acceptance criterion, a bug, missing tests, out-of-scope changes. Nits and
+            optional suggestions alone mean "merge".
+          claude_args: |
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr review:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*)"
+            --disallowedTools "Edit,Write,Bash(git push:*),Bash(git commit:*),Bash(gh pr review --approve:*),Bash(gh pr review -a:*),Bash(gh pr merge:*)"
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["merge","needs_changes"]},"summary":{"type":"string"}},"required":["verdict","summary"]}'
+
+      - name: Update labels
+        id: labels
+        if: always()
+        env:
+          OUT: ${{ steps.claude.outputs.structured_output }}
+          FIX_FOLLOWS: ${{ inputs.fix_follows }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          OUT=${OUT:-'{}'}
+          verdict=$(printf '%s' "$OUT" | jq -r '.verdict // empty' 2>/dev/null || true)
+          echo "verdict=$verdict"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          case "$verdict" in
+            merge)
+              gh issue edit "$ISSUE" -R "$REPO" --add-label swf:in-review ;;
+            needs_changes)
+              gh label create swf:changes-requested -R "$REPO" --color e99695 \
+                --description "swf: reviewer asked for changes" 2>/dev/null || true
+              gh issue edit "$ISSUE" -R "$REPO" --add-label swf:changes-requested
+              gh issue edit "$ISSUE" -R "$REPO" --remove-label swf:in-review 2>/dev/null || true
+              if [ "$FIX_FOLLOWS" != true ]; then
+                gh issue comment "$ISSUE" -R "$REPO" --body "swf: the reviewer still asks for changes on #$PR after the automatic fix round. Check the review, then merge, close, or add \`swf:ready\` for another fix round."
+              fi ;;
+            *)
+              gh issue comment "$ISSUE" -R "$REPO" --body "swf reviewer stopped before giving a verdict on #$PR. The PR is still open. Logs: $RUN_URL" ;;
+          esac
